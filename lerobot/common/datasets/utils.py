@@ -15,12 +15,14 @@
 # limitations under the License.
 import json
 import re
+import os
 import warnings
 from functools import cache
 from pathlib import Path
 from typing import Dict
 
 import datasets
+import fsspec
 import torch
 from datasets import load_dataset, load_from_disk
 from huggingface_hub import DatasetCard, HfApi, hf_hub_download, snapshot_download
@@ -85,7 +87,11 @@ def hf_transform_to_torch(items_dict: dict[torch.Tensor | None]):
             # For now we leave this part up to the user to choose how to address
             # language conditioned tasks
             pass
-        elif isinstance(first_item, dict) and "path" in first_item and "timestamp" in first_item:
+        elif (
+            isinstance(first_item, dict)
+            and "path" in first_item
+            and "timestamp" in first_item
+        ):
             # video frame will be processed downstream
             pass
         elif first_item is None:
@@ -116,14 +122,18 @@ def get_hf_dataset_safe_version(repo_id: str, version: str) -> str:
         return version
 
 
-def load_hf_dataset(repo_id: str, version: str, root: Path, split: str) -> datasets.Dataset:
+def load_hf_dataset(
+    repo_id: str, version: str, root: Path, split: str
+) -> datasets.Dataset:
     """hf_dataset contains all the observations, states, actions, rewards, etc."""
     if root is not None:
-        hf_dataset = load_from_disk(str(Path(root) / repo_id / "train"))
+        hf_dataset = load_from_disk(os.path.join(root, repo_id, "train"))
         # TODO(rcadene): clean this which enables getting a subset of dataset
         if split != "train":
             if "%" in split:
-                raise NotImplementedError(f"We dont support splitting based on percentage for now ({split}).")
+                raise NotImplementedError(
+                    f"We dont support splitting based on percentage for now ({split})."
+                )
             match_from = re.search(r"train\[(\d+):\]", split)
             match_to = re.search(r"train\[:(\d+)\]", split)
             if match_from:
@@ -155,14 +165,30 @@ def load_episode_data_index(repo_id, version, root) -> dict[str, torch.Tensor]:
     ```
     """
     if root is not None:
-        path = Path(root) / repo_id / "meta_data" / "episode_data_index.safetensors"
+        path = os.path.join(
+            root, repo_id, "meta_data", "episode_data_index.safetensors"
+        )
     else:
         safe_version = get_hf_dataset_safe_version(repo_id, version)
         path = hf_hub_download(
-            repo_id, "meta_data/episode_data_index.safetensors", repo_type="dataset", revision=safe_version
+            repo_id,
+            "meta_data/episode_data_index.safetensors",
+            repo_type="dataset",
+            revision=safe_version,
         )
 
-    return load_file(path)
+    # Handle S3 paths using fsspec if root is an S3 path
+    if path.startswith("s3://"):
+        # Copy the file from S3 to a temporary local file
+        fs = fsspec.filesystem("s3")
+        local_temp_path = "/tmp/episode_data_index.safetensors"
+        fs.get(path, local_temp_path)
+        path = local_temp_path
+
+    # Use the unchanged load_file function to load the safetensors file
+    episode_data_index = load_file(path, device="cpu")
+
+    return episode_data_index
 
 
 def load_stats(repo_id, version, root) -> dict[str, dict[str, torch.Tensor]]:
@@ -174,12 +200,22 @@ def load_stats(repo_id, version, root) -> dict[str, dict[str, torch.Tensor]]:
     ```
     """
     if root is not None:
-        path = Path(root) / repo_id / "meta_data" / "stats.safetensors"
+        path = os.path.join(root, repo_id, "meta_data", "stats.safetensors")
     else:
         safe_version = get_hf_dataset_safe_version(repo_id, version)
         path = hf_hub_download(
-            repo_id, "meta_data/stats.safetensors", repo_type="dataset", revision=safe_version
+            repo_id,
+            "meta_data/stats.safetensors",
+            repo_type="dataset",
+            revision=safe_version,
         )
+
+    # Handle S3 paths using fsspec if root is an S3 path
+    if path.startswith("s3://"):
+        fs = fsspec.filesystem("s3")
+        local_temp_path = "/tmp/stats.safetensors"
+        fs.get(path, local_temp_path)
+        path = local_temp_path
 
     stats = load_file(path)
     return unflatten_dict(stats)
@@ -194,10 +230,19 @@ def load_info(repo_id, version, root) -> dict:
     ```
     """
     if root is not None:
-        path = Path(root) / repo_id / "meta_data" / "info.json"
+        path = os.path.join(root, repo_id, "meta_data", "info.json")
     else:
         safe_version = get_hf_dataset_safe_version(repo_id, version)
-        path = hf_hub_download(repo_id, "meta_data/info.json", repo_type="dataset", revision=safe_version)
+        path = hf_hub_download(
+            repo_id, "meta_data/info.json", repo_type="dataset", revision=safe_version
+        )
+
+    # Handle S3 paths using fsspec if root is an S3 path
+    if path.startswith("s3://"):
+        fs = fsspec.filesystem("s3")
+        local_temp_path = "/tmp/info.json"
+        fs.get(path, local_temp_path)
+        path = local_temp_path
 
     with open(path) as f:
         info = json.load(f)
@@ -206,11 +251,15 @@ def load_info(repo_id, version, root) -> dict:
 
 def load_videos(repo_id, version, root) -> Path:
     if root is not None:
-        path = Path(root) / repo_id / "videos"
+        import cloudpathlib
+
+        path = cloudpathlib.AnyPath(root) / repo_id / "videos"
     else:
         # TODO(rcadene): we download the whole repo here. see if we can avoid this
         safe_version = get_hf_dataset_safe_version(repo_id, version)
-        repo_dir = snapshot_download(repo_id, repo_type="dataset", revision=safe_version)
+        repo_dir = snapshot_download(
+            repo_id, repo_type="dataset", revision=safe_version
+        )
         path = Path(repo_dir) / "videos"
 
     return path
@@ -265,7 +314,9 @@ def load_previous_and_future_frames(
     ep_data_ids = torch.arange(ep_data_id_from, ep_data_id_to, 1)
 
     # load timestamps
-    ep_timestamps = hf_dataset.select_columns("timestamp")[ep_data_id_from:ep_data_id_to]["timestamp"]
+    ep_timestamps = hf_dataset.select_columns("timestamp")[
+        ep_data_id_from:ep_data_id_to
+    ]["timestamp"]
     ep_timestamps = torch.stack(ep_timestamps)
 
     # we make the assumption that the timestamps are sorted
@@ -287,7 +338,9 @@ def load_previous_and_future_frames(
         is_pad = min_ > tolerance_s
 
         # check violated query timestamps are all outside the episode range
-        assert ((query_ts[is_pad] < ep_first_ts) | (ep_last_ts < query_ts[is_pad])).all(), (
+        assert (
+            (query_ts[is_pad] < ep_first_ts) | (ep_last_ts < query_ts[is_pad])
+        ).all(), (
             f"One or several timestamps unexpectedly violate the tolerance ({min_} > {tolerance_s=}) inside episode range."
             "This might be due to synchronization issues with timestamps during data collection."
         )
@@ -309,7 +362,9 @@ def load_previous_and_future_frames(
     return item
 
 
-def calculate_episode_data_index(hf_dataset: datasets.Dataset) -> Dict[str, torch.Tensor]:
+def calculate_episode_data_index(
+    hf_dataset: datasets.Dataset,
+) -> Dict[str, torch.Tensor]:
     """
     Calculate episode data index for the provided HuggingFace Dataset. Relies on episode_index column of hf_dataset.
 
@@ -379,7 +434,9 @@ def reset_episode_index(hf_dataset: datasets.Dataset) -> datasets.Dataset:
     }
 
     def modify_ep_idx_func(example):
-        example["episode_index"] = episode_idx_to_reset_idx_mapping[example["episode_index"].item()]
+        example["episode_index"] = episode_idx_to_reset_idx_mapping[
+            example["episode_index"].item()
+        ]
         return example
 
     hf_dataset = hf_dataset.map(modify_ep_idx_func)
@@ -415,7 +472,9 @@ def create_branch(repo_id, *, branch: str, repo_type: str | None = None):
     api.create_branch(repo_id, repo_type=repo_type, branch=branch)
 
 
-def create_lerobot_dataset_card(tags: list | None = None, text: str | None = None) -> DatasetCard:
+def create_lerobot_dataset_card(
+    tags: list | None = None, text: str | None = None
+) -> DatasetCard:
     card = DatasetCard(DATASET_CARD_TEMPLATE)
     card.data.task_categories = ["robotics"]
     card.data.tags = ["LeRobot"]
